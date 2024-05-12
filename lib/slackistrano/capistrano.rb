@@ -2,6 +2,7 @@ require_relative 'messaging/base'
 require 'net/http'
 require 'json'
 require 'forwardable'
+require 'faraday'
 
 load File.expand_path("../tasks/slack.rake", __FILE__)
 
@@ -55,6 +56,27 @@ module Slackistrano
 
     private ##################################################
 
+    def faraday_client(base_url: nil)
+      Faraday.new(url: base_url, ssl: { verify: false }) do |faraday|
+        faraday.response(:logger, ::Logger.new($stdout), headers: true, bodies: { request: true, response: true })
+        faraday.headers['Content-Type'] = 'application/json'
+        faraday.adapter Faraday.default_adapter
+      end
+    end
+
+    def handle_response(response)
+      if response.status.between?(200, 299)
+        backend.info("[slackistrano] Success: Posted to Slack.")
+      else
+        backend.warn("[slackistrano] Slack API Failure!")
+        backend.warn("[slackistrano]   Status: #{response.status}")
+        backend.warn("[slackistrano]   Body: #{response.body}")
+      end
+    rescue Faraday::Error => e
+      backend.warn("[slackistrano] Error communicating with Slack!")
+      backend.warn("[slackistrano]   Error: #{e.message}")
+    end
+
     def post(payload)
 
       if dry_run?
@@ -67,14 +89,6 @@ module Slackistrano
       rescue => e
         backend.warn("[slackistrano] Error notifying Slack!")
         backend.warn("[slackistrano]   Error: #{e.inspect}")
-      end
-
-      if response && response.code !~ /^2/
-        warn("[slackistrano] Slack API Failure!")
-        warn("[slackistrano]   URI: #{response.uri}")
-        warn("[slackistrano]   Code: #{response.code}")
-        warn("[slackistrano]   Message: #{response.message}")
-        warn("[slackistrano]   Body: #{response.body}") if response.message != response.body && response.body !~ /<html/
       end
     end
 
@@ -89,15 +103,23 @@ module Slackistrano
     def post_to_slack_as_slackbot(payload = {})
       uri = URI(URI.encode("https://#{@messaging.team}.slack.com/services/hooks/slackbot?token=#{@messaging.token}&channel=#{payload[:channel]}"))
       text = (payload[:attachments] || [payload]).collect { |a| a[:text] }.join("\n")
-      Net::HTTP.start(uri.host, uri.port, use_ssl: true) do |http|
-        http.request_post uri, text
+
+      response = faraday_client(base_url: uri.to_s).post do |req|
+        req.headers['Content-Type'] = 'text/plain'
+        req.body = text
       end
+
+      handle_response(response)
     end
 
     def post_to_slack_as_webhook(payload = {})
-      params = {'payload' => payload.to_json}
       uri = URI(@messaging.webhook)
-      Net::HTTP.post_form(uri, params)
+      payload = [payload].collect { |a| a[:text] }.join("\n") if payload[:attachments].nil?
+      response = faraday_client(base_url: uri.to_s).post do |req|
+        req.body = { text: payload }.to_json
+      end
+
+      handle_response(response)
     end
 
     def dry_run?
